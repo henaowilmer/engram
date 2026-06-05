@@ -33,6 +33,7 @@ For other docs:
 | [Codebase Guide](docs/CODEBASE-GUIDE.md)    | Definitive guide to repository structure, package ownership, flows, and maintainer guardrails |
 | [Architecture](docs/ARCHITECTURE.md)        | How it works, session lifecycle, CLI reference, project structure                             |
 | [Plugins](docs/PLUGINS.md)                  | OpenCode & Claude Code plugin details                                                         |
+| [Team Usage](docs/TEAM-USAGE.md)            | Scope conventions, language strategy, and sync behavior for collaborative teams               |
 | [Comparison](docs/COMPARISON.md)            | Why Engram vs claude-mem                                                                      |
 
 ---
@@ -133,8 +134,8 @@ Engram is local-first: local SQLite is authoritative; cloud features are optiona
 ### Observations
 
 - `POST /observations` — Add observation. Body: `{session_id, type, title, content, tool_name?, project?, scope?, topic_key?}`
-- `GET /observations` — Recent observations compatibility endpoint. Query: `?project=X&scope=project|personal&limit=N&sort=created_at:desc`
-- `GET /observations/recent` — Recent observations. Query: `?project=X&scope=project|personal&limit=N`
+- `GET /observations` — Recent observations compatibility endpoint. Query: `?project=X&scope=project|personal|global&limit=N&sort=created_at:desc`
+- `GET /observations/recent` — Recent observations. Query: `?project=X&scope=project|personal|global&limit=N`
 - `GET /observations/{id}` — Get single observation by ID
 - `PATCH /observations/{id}` — Update fields. Body: `{title?, content?, type?, project?, scope?, topic_key?}`
 - `DELETE /observations/{id}` — Delete observation (`?hard=true` for hard delete, soft delete by default)
@@ -161,7 +162,7 @@ Engram is local-first: local SQLite is authoritative; cloud features are optiona
 
 ### Context
 
-- `GET /context` — Formatted context. Query: `?project=X&scope=project|personal`
+- `GET /context` — Formatted context. Query: `?project=X&scope=project|personal|global`
 
 ### Passive Capture
 
@@ -453,11 +454,24 @@ Response:
 
 ### Environment Variables
 
-| Variable          | Description                                                                                                                                         | Default              |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| `ENGRAM_DATA_DIR` | Override data directory                                                                                                                             | `~/.engram`          |
-| `ENGRAM_PORT`     | Override HTTP server port                                                                                                                           | `7437`               |
-| `ENGRAM_PROJECT`  | Default project for `engram serve` `GET /sync/status` when no `project` query param is supplied. When unset, cwd detection is used as the fallback. | cwd-detected project |
+| Variable                        | Description                                                                                                                                                                                                                                               | Default              |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `ENGRAM_DATA_DIR`               | Override data directory                                                                                                                                                                                                                                   | `~/.engram`          |
+| `ENGRAM_PORT`                   | Override HTTP server port                                                                                                                                                                                                                                 | `7437`               |
+| `ENGRAM_PROJECT`                | Process-level default project override. For `engram serve`: used as the fallback when `GET /sync/status` receives no `project` query param. For `engram mcp`: sets `MCPConfig.DefaultProject`, which takes precedence over cwd detection for all read and write tools for the lifetime of that MCP process. When unset, cwd detection is used as the fallback. | cwd-detected project |
+| `ENGRAM_HTTP_TOKEN`             | Optional Bearer auth for the local HTTP server. When set, the following routes require `Authorization: Bearer <token>`: `DELETE /sessions/{id}`, `DELETE /observations/{id}`, `DELETE /prompts/{id}`, `GET /export`, `POST /import`, `POST /projects/migrate`. Comparison is constant-time. Token is read at request time (no restart needed). When unset, all routes are open (zero-config default). | (unset — open) |
+| `ENGRAM_TIMEZONE`               | Timezone for timestamp display in the TUI and cloud dashboard. Accepts any IANA zone name (e.g. `America/New_York`, `Europe/Berlin`). Falls back to system local time when unset or invalid.                                                               | system local         |
+| `ENGRAM_AGENT_CLI`              | LLM runner name used by `engram conflicts scan --semantic` and the HTTP `/conflicts/scan` endpoint. Accepted values: `claude`, `opencode`.                                                                                                                | (unset)              |
+| `ENGRAM_CLOUD_AUTOSYNC`         | Set to `1` to enable background autosync. Requires `ENGRAM_CLOUD_TOKEN` and `ENGRAM_CLOUD_SERVER` to also be set.                                                                                                                                         | (unset — disabled)   |
+| `ENGRAM_CLOUD_SERVER`           | Cloud server URL used by the autosync manager and `engram sync --cloud`.                                                                                                                                                                                  | (unset)              |
+| `ENGRAM_DATABASE_URL`           | Postgres DSN for `engram cloud serve`.                                                                                                                                                                                                                    | (unset)              |
+| `ENGRAM_CLOUD_HOST`             | Bind host for `engram cloud serve`.                                                                                                                                                                                                                       | `127.0.0.1`          |
+| `ENGRAM_CLOUD_MAX_PUSH_BYTES`   | Max cloud push payload bytes.                                                                                                                                                                                                                             | `8388608`            |
+| `ENGRAM_CLOUD_TOKEN`            | Bearer token required in authenticated `engram cloud serve` mode.                                                                                                                                                                                         | (unset)              |
+| `ENGRAM_CLOUD_INSECURE_NO_AUTH` | Set to `1` for local insecure cloud serve (no auth). Cannot be combined with `ENGRAM_CLOUD_TOKEN`.                                                                                                                                                        | (unset)              |
+| `ENGRAM_CLOUD_ALLOWED_PROJECTS` | Comma-separated project allowlist enforced by `engram cloud serve`. Required in both token-auth and insecure modes. Use `*` to allow all projects (dev/internal deploys) — bypasses per-project name enforcement while still requiring a non-empty project on each request. | (unset) |
+| `ENGRAM_JWT_SECRET`             | Required in authenticated cloud serve mode. Must be explicitly set to a non-default value.                                                                                                                                                                | (unset)              |
+| `ENGRAM_CLOUD_ADMIN`            | Optional admin-only dashboard token in authenticated cloud serve mode. Ignored/rejected in insecure mode.                                                                                                                                                 | (unset)              |
 
 ### Conflict Audit CLI (admin)
 
@@ -514,7 +528,7 @@ Inspect or replay the `sync_apply_deferred` queue.
 
 ### Cloud CLI (opt-in)
 
-- `engram cloud status` — show current cloud config state plus auth/sync readiness without mutating local state
+- `engram cloud status` — show current cloud config state plus auth/sync readiness without mutating local state. When cloud is configured, also probes the local `engram serve` daemon at `127.0.0.1:7437` (respects `ENGRAM_PORT`) and prints a `Local daemon:` line (`running` / `not running` / `unreachable`) so you can detect a silently dead autosync. Exit code is unaffected; the line is informational
 - `engram cloud enroll <project>` — enroll one project for cloud replication
 - `engram cloud config --server <url>` — persist cloud server URL to `~/.engram/cloud.json`
 - `engram cloud serve` — run cloud backend API + dashboard (`/dashboard`) using Postgres config from env
@@ -549,7 +563,7 @@ Cloud runtime envs for `engram cloud serve`:
 | `ENGRAM_PORT`                   | no                       | Runtime port (default `8080`)                                                         |
 | `ENGRAM_CLOUD_HOST`             | no                       | Bind host (default `127.0.0.1`; use `0.0.0.0` for containers)                         |
 | `ENGRAM_CLOUD_MAX_PUSH_BYTES`   | no                       | Max chunk/mutation push request body bytes (default `8388608`)                        |
-| `ENGRAM_CLOUD_ALLOWED_PROJECTS` | yes                      | Comma-separated allowlist; always required (authenticated + insecure modes)           |
+| `ENGRAM_CLOUD_ALLOWED_PROJECTS` | yes                      | Comma-separated allowlist; always required (authenticated + insecure modes). Use `*` to allow all projects (dev/internal deploys) — bypasses per-project name enforcement while still requiring a non-empty project on each request. |
 | `ENGRAM_CLOUD_TOKEN`            | yes (authenticated mode) | Enables bearer auth mode                                                              |
 | `ENGRAM_JWT_SECRET`             | yes (authenticated mode) | Must be explicitly set and non-default when token mode is enabled                     |
 | `ENGRAM_CLOUD_INSECURE_NO_AUTH` | no                       | Set to `1` only for local insecure mode; cannot be combined with `ENGRAM_CLOUD_TOKEN` |
@@ -760,6 +774,10 @@ Returns success even when cwd is ambiguous — empty `project` + non-empty `avai
 
 Search persistent memory across all sessions. Supports FTS5 full-text search with type/project/scope/limit filters.
 
+Set `all_projects: true` to search across every project instead of the resolved one. This bypasses project detection entirely and ignores the `project` argument, so an agent can recall a decision logged elsewhere without knowing the project key. The response envelope reports `project_source: "all_projects"` and an empty `project` to reflect the cross-project scope.
+
+Scope values accepted by the `scope` parameter: `project` (default), `personal`, `global`. When `scope: personal` is passed without an explicit `project` override, the project filter is cleared and personal observations are searched across all projects (cross-project personal scope).
+
 When an observation has judged relations in `memory_relations`, the result entry includes annotation lines immediately after the title/content block:
 
 ```
@@ -779,7 +797,7 @@ Save structured observations. The tool description teaches agents the format:
 
 - **title**: Short, searchable (e.g. "JWT auth middleware")
 - **type**: `decision` | `architecture` | `bugfix` | `pattern` | `config` | `discovery` | `learning`
-- **scope**: `project` (default) | `personal`
+- **scope**: `project` (default) | `personal` | `global` — see [Team Usage](docs/TEAM-USAGE.md) for conventions and sync caveats
 - **topic_key**: optional canonical topic id (e.g. `architecture/auth-model`) used to upsert evolving memories
 - **capture_prompt**: optional boolean, default `true`; when current prompt context is available in the same MCP process for the same project/session, Engram best-effort records it alongside the observation. If that process-local context is unavailable or prompt capture fails, `mem_save` still succeeds. Automated pipeline saves such as SDD artifacts should pass `false`.
 - **content**: Structured with `**What**`, `**Why**`, `**Where**`, `**Learned**`; required unless the legacy `observation` alias is provided
@@ -808,6 +826,8 @@ When called in the same MCP process, this also feeds process-local current promp
 ### mem_context
 
 Get recent memory context from previous sessions — shows sessions, prompts, and observations, with optional scope filtering for observations.
+
+Scope values accepted by the `scope` parameter: `project` (default), `personal`, `global`. When `scope: personal` is passed without an explicit `project` override, the project filter is cleared and personal observations are returned across all projects (cross-project personal scope).
 
 ### mem_stats
 
@@ -917,7 +937,7 @@ Format for `mem_save`:
 
 - **title**: Verb + what — short, searchable (e.g. "Fixed N+1 query in UserList", "Chose Zustand over Redux")
 - **type**: `bugfix` | `decision` | `architecture` | `discovery` | `pattern` | `config` | `preference`
-- **scope**: `project` (default) | `personal`
+- **scope**: `project` (default) | `personal` | `global`
 - **topic_key** (optional, recommended for evolving decisions): stable key like `architecture/auth-model`
 - **content**:
   ```
@@ -1019,7 +1039,7 @@ MCP tools resolve project names at call time using the shared detection chain:
 5. Multiple git-repo children of cwd returns `ambiguous_project` with `available_projects`
 6. Current working directory basename
 
-The MCP command does not support startup-time `--project` or `ENGRAM_PROJECT` overrides; `engram mcp` only parses `--tools` for MCP tool allowlisting.
+`engram mcp` accepts a process-level default project via `--project <name>` / `--project=<name>` or `ENGRAM_PROJECT=<name>`. This override takes precedence over cwd detection for all read and write tools throughout the lifetime of that MCP process. It is a trusted startup-time value — use it when the host cannot supply a reliable cwd (VS Code, WSL, CI, Docker).
 
 ### Similar-project warnings
 
@@ -1134,6 +1154,7 @@ Interactive Bubbletea-based terminal UI. Launch with `engram tui`.
 
 - `j/k` or arrow keys — Navigate lists
 - `Enter` — Select / drill into detail
+- `c` — Copy observation content to clipboard (OSC 52; works in search results, recent list, detail, and session views)
 - `t` — View timeline for selected observation
 - `s` or `/` — Quick search from any screen
 - `Esc` or `q` — Go back / quit
@@ -1150,7 +1171,9 @@ Interactive Bubbletea-based terminal UI. Launch with `engram tui`.
 
 ## Running as a Service
 
-### Using systemd
+Without a service supervisor, `engram serve` dies whenever the binary is replaced (e.g. on `brew upgrade engram`) or the host reboots, and autosync stops silently. The templates below restart it automatically. Use `engram cloud status` afterwards to confirm — the `Local daemon:` line should report `running on port 7437`.
+
+### Using systemd (Linux)
 
 1. Move binary to `~/.local/bin` (ensure it's in your `$PATH`)
 2. Create directories: `mkdir -p ~/.engram ~/.config/systemd/user`
@@ -1175,6 +1198,98 @@ Environment=ENGRAM_DATA_DIR=%h/.engram
 [Install]
 WantedBy=default.target
 ```
+
+### Using launchd (macOS)
+
+This is the recommended setup for Homebrew users on macOS. With `KeepAlive=true`, launchd relaunches `engram serve` automatically after `brew upgrade engram` replaces the binary, so autosync survives upgrades.
+
+1. Find your binary path: `which engram` (typically `/opt/homebrew/bin/engram` on Apple Silicon or `/usr/local/bin/engram` on Intel)
+2. Create the data dir if missing: `mkdir -p ~/.engram`
+3. Create `~/Library/LaunchAgents/com.gentleman-programming.engram.plist` with the contents below — replace `<HOME>` with the absolute path of your home directory (`echo $HOME`) and adjust the binary path if `which engram` returned something different
+4. Load it: `launchctl load ~/Library/LaunchAgents/com.gentleman-programming.engram.plist`
+5. Verify: `launchctl list | grep engram` and `engram cloud status` (the `Local daemon:` line should report `running on port 7437`)
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gentleman-programming.engram</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/engram</string>
+        <string>serve</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string><HOME></string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ENGRAM_DATA_DIR</key>
+        <string><HOME>/.engram</string>
+        <!-- Uncomment and fill these to enable cloud autosync:
+        <key>ENGRAM_CLOUD_AUTOSYNC</key>
+        <string>1</string>
+        <key>ENGRAM_CLOUD_SERVER</key>
+        <string>https://your-cloud-host</string>
+        <key>ENGRAM_CLOUD_TOKEN</key>
+        <string>your-cloud-token</string>
+        -->
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string><HOME>/.engram/serve.out.log</string>
+    <key>StandardErrorPath</key>
+    <string><HOME>/.engram/serve.err.log</string>
+</dict>
+</plist>
+```
+
+To unload (stop and disable): `launchctl unload ~/Library/LaunchAgents/com.gentleman-programming.engram.plist`. To reload after editing the plist: unload, then load again.
+
+> **Note on `brew upgrade`:** launchd does not expand `$HOME` or `~` inside plist values, which is why the template uses literal absolute paths.
+
+### Using Windows Task Scheduler
+
+Windows Task Scheduler is the native service equivalent on Windows. It restarts `engram serve` on login and after reboots, keeping autosync alive without a third-party service manager.
+
+**Setup steps:**
+
+1. Confirm `engram.exe` is in your `PATH`: open PowerShell and run `Get-Command engram`.
+2. Set `ENGRAM_CLOUD_TOKEN` (and any other cloud vars) as a **user or system environment variable** in System Properties → Advanced → Environment Variables. Task Scheduler does not inherit session environment variables, so tokens set in your shell profile or in `$env:...` within a PowerShell session will not be visible to the scheduled task.
+3. Create the scheduled task by running the PowerShell snippet below in an elevated terminal (Run as Administrator), or import it manually through the Task Scheduler GUI.
+4. Verify: after the next login (or trigger manually), run `engram cloud status` — the `Local daemon:` line should report `running on port 7437`.
+
+```powershell
+$action  = New-ScheduledTaskAction `
+    -Execute  "powershell.exe" `
+    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -Command `"Start-Process engram -ArgumentList 'serve' -NoNewWindow`""
+
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+
+$settings = New-ScheduledTaskSettingsSet `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
+    -RestartCount 5 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -StartWhenAvailable
+
+Register-ScheduledTask `
+    -TaskName    "EngramMemoryServer" `
+    -Action      $action `
+    -Trigger     $trigger `
+    -Settings    $settings `
+    -RunLevel    Limited `
+    -Description "Engram persistent memory server (engram serve)"
+```
+
+> **Environment variables:** `ENGRAM_CLOUD_TOKEN`, `ENGRAM_CLOUD_SERVER`, `ENGRAM_CLOUD_AUTOSYNC`, and `ENGRAM_DATA_DIR` must be set as persistent user or system environment variables (Control Panel → System → Advanced → Environment Variables) so Task Scheduler can read them. Variables you `export` or set with `$env:` in a terminal session are not visible to scheduled tasks.
+
+> **Logs:** To capture stdout/stderr, redirect output in the PowerShell command string, for example: `... -Command "Start-Process engram -ArgumentList 'serve' -NoNewWindow -RedirectStandardOutput '$env:USERPROFILE\.engram\serve.out.log' -RedirectStandardError '$env:USERPROFILE\.engram\serve.err.log'"`. Ensure the log files are opened with UTF-8 encoding (`-Encoding UTF8`) if you post-process them.
+
+> **Stopping the task:** `Stop-ScheduledTask -TaskName "EngramMemoryServer"` or `Unregister-ScheduledTask -TaskName "EngramMemoryServer" -Confirm:$false` to remove it entirely.
 
 ---
 

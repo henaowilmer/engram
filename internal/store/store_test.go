@@ -2118,6 +2118,148 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 			t.Fatalf("expected missing provenance to remain blocked, got %+v", diagnosis)
 		}
 	})
+
+	// Regression test for GitHub issue #446: when both repairable and blocked
+	// mutations coexist, RepairCloudUpgrade(apply=true) must apply the
+	// repairable subset and return Applied:true with Class=Blocked (and the
+	// message must reference the actual blocker, not the low-seq repairable
+	// entry that happens to be first in Findings order).
+	t.Run("partial apply: repairable mutations applied even when a blocker is queued", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("partial-repair-s1", "partial-repair-proj", "/tmp/partial-repair"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		// Create an observation so we have authoritative local state for the
+		// repairable mutation.
+		obsID, err := s.AddObservation(AddObservationParams{
+			SessionID: "partial-repair-s1",
+			Type:      "decision",
+			Title:     "Authoritative title",
+			Content:   "Authoritative content",
+			Project:   "partial-repair-proj",
+			Scope:     "project",
+		})
+		if err != nil {
+			t.Fatalf("add observation: %v", err)
+		}
+		if err := s.EnrollProject("partial-repair-proj"); err != nil {
+			t.Fatalf("enroll project: %v", err)
+		}
+
+		// Look up the observation's sync_id for payload construction.
+		var obsSyncID string
+		if err := s.db.QueryRow(`SELECT sync_id FROM observations WHERE id = ?`, obsID).Scan(&obsSyncID); err != nil {
+			t.Fatalf("lookup observation sync_id: %v", err)
+		}
+
+		// Insert a REPAIRABLE observation mutation (missing title — low seq,
+		// will naturally come before the blocker we insert next).
+		repairablePayload := `{"sync_id":"` + obsSyncID + `","session_id":"partial-repair-s1","type":"decision","content":"legacy payload missing title","scope":"project"}`
+		if _, err := s.execHook(s.db,
+			`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			DefaultSyncTargetKey,
+			SyncEntityObservation,
+			obsSyncID,
+			SyncOpUpsert,
+			repairablePayload,
+			SyncSourceLocal,
+			"partial-repair-proj",
+		); err != nil {
+			t.Fatalf("insert repairable observation mutation: %v", err)
+		}
+
+		// Create two observations for source/target of the relation we use as
+		// the blocker mutation.
+		srcID, err := s.AddObservation(AddObservationParams{SessionID: "partial-repair-s1", Type: "decision", Title: "Src", Content: "src", Project: "partial-repair-proj", Scope: "project"})
+		if err != nil {
+			t.Fatalf("add source observation: %v", err)
+		}
+		dstID, err := s.AddObservation(AddObservationParams{SessionID: "partial-repair-s1", Type: "decision", Title: "Dst", Content: "dst", Project: "partial-repair-proj", Scope: "project"})
+		if err != nil {
+			t.Fatalf("add dest observation: %v", err)
+		}
+		var srcSyncID, dstSyncID string
+		if err := s.db.QueryRow(`SELECT sync_id FROM observations WHERE id = ?`, srcID).Scan(&srcSyncID); err != nil {
+			t.Fatalf("lookup src sync_id: %v", err)
+		}
+		if err := s.db.QueryRow(`SELECT sync_id FROM observations WHERE id = ?`, dstID).Scan(&dstSyncID); err != nil {
+			t.Fatalf("lookup dst sync_id: %v", err)
+		}
+
+		// Insert a BLOCKED relation mutation (missing provenance — high seq,
+		// comes after the repairable entry so Findings[0] would point to the
+		// repairable entry without the fix).
+		const blockerEntityKey = "rel-partial-blocked-446"
+		blockerPayload := `{"sync_id":"` + blockerEntityKey + `","source_id":"` + srcSyncID + `","target_id":"` + dstSyncID + `","relation":"compatible","project":"partial-repair-proj"}`
+		if _, err := s.execHook(s.db,
+			`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			DefaultSyncTargetKey,
+			SyncEntityRelation,
+			blockerEntityKey,
+			SyncOpUpsert,
+			blockerPayload,
+			SyncSourceLocal,
+			"partial-repair-proj",
+		); err != nil {
+			t.Fatalf("insert blocked relation mutation: %v", err)
+		}
+
+		// Confirm pre-conditions: diagnosis must see exactly one repairable
+		// and one blocked entry.
+		diag, err := s.DiagnoseCloudUpgradeLegacyMutations("partial-repair-proj")
+		if err != nil {
+			t.Fatalf("pre-condition diagnose: %v", err)
+		}
+		if diag.RepairableCount != 1 || diag.BlockedCount != 1 {
+			t.Fatalf("expected 1 repairable + 1 blocked pre-condition, got %+v", diag)
+		}
+
+		// Find the seq of the blocked finding so we can assert the message
+		// references the right entry.
+		var blockerSeq int64
+		for _, f := range diag.Findings {
+			if !f.Repairable {
+				blockerSeq = f.Seq
+				break
+			}
+		}
+		if blockerSeq == 0 {
+			t.Fatal("pre-condition: could not locate blocked finding seq")
+		}
+		// Also verify that Findings[0] is NOT the blocker (i.e. lowest-seq is
+		// the repairable one); this is the exact condition that triggered the
+		// wrong-message bug.
+		if diag.Findings[0].Seq == blockerSeq {
+			t.Fatalf("pre-condition: expected Findings[0] to be repairable (lowest seq), but got blocker seq=%d", blockerSeq)
+		}
+
+		// === THE ACTUAL ASSERTION ===
+		// With apply=true, repairable mutations must be applied and the
+		// report must still surface the blocker clearly.
+		report, err := s.RepairCloudUpgrade("partial-repair-proj", true)
+		if err != nil {
+			t.Fatalf("repair with mixed repairable+blocker: %v", err)
+		}
+
+		// Applied MUST be true: at least the repairable mutation was applied.
+		if !report.Applied {
+			t.Fatalf("expected Applied=true (repairable subset was processed), got %+v", report)
+		}
+		// Class MUST be Blocked because the non-repairable mutation is still present.
+		if report.Class != UpgradeRepairClassBlocked {
+			t.Fatalf("expected Class=%q, got %q (full report: %+v)", UpgradeRepairClassBlocked, report.Class, report)
+		}
+		// The message must name the BLOCKER seq, not the repairable entry.
+		blockerSeqStr := fmt.Sprintf("seq=%d", blockerSeq)
+		if !strings.Contains(report.Message, blockerSeqStr) {
+			t.Fatalf("expected message to reference blocker seq (%s), got %q", blockerSeqStr, report.Message)
+		}
+		// The message must also include entity_key for debuggability.
+		if !strings.Contains(report.Message, blockerEntityKey) {
+			t.Fatalf("expected message to include entity_key=%q, got %q", blockerEntityKey, report.Message)
+		}
+	})
 }
 
 func TestRollbackCloudUpgradeSafetyBoundary(t *testing.T) {
@@ -7713,5 +7855,437 @@ func TestGetDeferred_NotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not found") {
 		t.Errorf("expected error to contain 'not found'; got %q", err.Error())
+	}
+}
+
+func TestNormalizeScopeHandlesGlobal(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"global", "global"},
+		{"Global", "global"},
+		{"GLOBAL", "global"},
+		{"  global  ", "global"},
+		{"personal", "personal"},
+		{"Personal", "personal"},
+		{"project", "project"},
+		{"Project", "project"},
+		{"", "project"},
+		{"unknown", "project"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := normalizeScope(tc.input)
+			if got != tc.want {
+				t.Errorf("normalizeScope(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSearchLegacyMixedCaseProject reproduces issue #146:
+// observations stored with a mixed-case project name (legacy data pre-normalization)
+// must be found when searched with a normalized (lowercase) project name.
+//
+// Previously, Search and ProjectExists used case-sensitive "project = ?" which
+// caused all MCP tool calls to return empty results for such projects.
+func TestSearchLegacyMixedCaseProject(t *testing.T) {
+	s := newTestStore(t)
+
+	// Insert a session and observation directly with mixed-case project name,
+	// bypassing AddObservation normalization to simulate legacy data.
+	legacyProject := "Ebook2Audio"
+	_, err := s.db.Exec(
+		`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`,
+		"legacy-mixed-sess", legacyProject, "/tmp/ebook",
+	)
+	if err != nil {
+		t.Fatalf("insert legacy session: %v", err)
+	}
+
+	_, err = s.db.Exec(`
+		INSERT INTO observations (session_id, type, title, content, project, scope)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		"legacy-mixed-sess", "bugfix",
+		"Fixed log routing in DisplayManager",
+		"Corrected log routing so debug output goes to stderr not stdout",
+		legacyProject, "project",
+	)
+	if err != nil {
+		t.Fatalf("insert legacy observation: %v", err)
+	}
+
+	// Re-build FTS index so the new row is searchable.
+	if _, err := s.db.Exec(`INSERT INTO observations_fts(observations_fts) VALUES('rebuild')`); err != nil {
+		t.Fatalf("rebuild FTS: %v", err)
+	}
+
+	normalizedProject := "ebook2audio"
+
+	// ProjectExists must find the legacy project via case-insensitive match.
+	exists, err := s.ProjectExists(normalizedProject)
+	if err != nil {
+		t.Fatalf("ProjectExists error: %v", err)
+	}
+	if !exists {
+		t.Error("ProjectExists returned false for mixed-case legacy project; want true")
+	}
+
+	// Search must return the observation when filtering by normalized project name.
+	results, err := s.Search("log routing", SearchOptions{
+		Project: normalizedProject,
+		Limit:   10,
+	})
+	if err != nil {
+		t.Fatalf("Search error: %v", err)
+	}
+	if len(results) == 0 {
+		t.Error("Search returned 0 results for legacy mixed-case project; want >=1")
+	}
+
+	// RecentObservations (used by mem_context) must also find the data.
+	obs, err := s.RecentObservations(normalizedProject, "", 10)
+	if err != nil {
+		t.Fatalf("RecentObservations error: %v", err)
+	}
+	if len(obs) == 0 {
+		t.Error("RecentObservations returned 0 results for legacy mixed-case project; want >=1")
+	}
+
+	// RecentSessions (used by mem_context) must also find the session.
+	sessions, err := s.RecentSessions(normalizedProject, 5)
+	if err != nil {
+		t.Fatalf("RecentSessions error: %v", err)
+	}
+	if len(sessions) == 0 {
+		t.Error("RecentSessions returned 0 results for legacy mixed-case project; want >=1")
+	}
+}
+
+// ─── DeleteProject tests ──────────────────────────────────────────────────────
+
+func TestDeleteProjectCascadesAllEntities(t *testing.T) {
+	s := newTestStore(t)
+
+	// Seed: one session with two observations and one prompt.
+	if err := s.CreateSession("s-del-proj-1", "alpha", "/tmp/alpha"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID1, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-del-proj-1",
+		Type:      "decision",
+		Title:     "obs-one",
+		Content:   "content one",
+		Project:   "alpha",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs 1: %v", err)
+	}
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "s-del-proj-1",
+		Type:      "bugfix",
+		Title:     "obs-two",
+		Content:   "content two",
+		Project:   "alpha",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs 2: %v", err)
+	}
+	_, err = s.AddPrompt(AddPromptParams{SessionID: "s-del-proj-1", Content: "prompt one", Project: "alpha"})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	result, err := s.DeleteProject("alpha", true)
+	if err != nil {
+		t.Fatalf("DeleteProject: %v", err)
+	}
+
+	if result.Project != "alpha" {
+		t.Errorf("result.Project = %q, want %q", result.Project, "alpha")
+	}
+	if result.ObservationsDeleted != 2 {
+		t.Errorf("ObservationsDeleted = %d, want 2", result.ObservationsDeleted)
+	}
+	if result.PromptsDeleted != 1 {
+		t.Errorf("PromptsDeleted = %d, want 1", result.PromptsDeleted)
+	}
+	if result.SessionsDeleted != 1 {
+		t.Errorf("SessionsDeleted = %d, want 1", result.SessionsDeleted)
+	}
+
+	// Verify rows are gone.
+	var obsCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE session_id = ?`, "s-del-proj-1").Scan(&obsCount); err != nil {
+		t.Fatalf("count observations: %v", err)
+	}
+	if obsCount != 0 {
+		t.Errorf("expected 0 observations after hard delete, got %d", obsCount)
+	}
+
+	var sessionCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE project = ?`, "alpha").Scan(&sessionCount); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessionCount != 0 {
+		t.Errorf("expected 0 sessions after DeleteProject, got %d", sessionCount)
+	}
+
+	var promptCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_prompts WHERE project = ?`, "alpha").Scan(&promptCount); err != nil {
+		t.Fatalf("count prompts: %v", err)
+	}
+	if promptCount != 0 {
+		t.Errorf("expected 0 prompts after DeleteProject, got %d", promptCount)
+	}
+
+	// Hard-deleted obs must also be gone from the table itself.
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE id = ?`, obsID1).Scan(&obsCount); err != nil {
+		t.Fatalf("count obs by id: %v", err)
+	}
+	if obsCount != 0 {
+		t.Errorf("expected obs #%d to be hard-deleted, got count %d", obsID1, obsCount)
+	}
+}
+
+func TestDeleteProjectSoftDeleteObservations(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s-del-proj-soft", "beta", "/tmp/beta"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddPrompt(AddPromptParams{SessionID: "s-del-proj-soft", Content: "p", Project: "beta"})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-del-proj-soft",
+		Type:      "decision",
+		Title:     "soft-obs",
+		Content:   "content",
+		Project:   "beta",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs: %v", err)
+	}
+
+	result, err := s.DeleteProject("beta", false)
+	if err != nil {
+		t.Fatalf("DeleteProject soft: %v", err)
+	}
+	if result.ObservationsDeleted != 1 {
+		t.Errorf("ObservationsDeleted = %d, want 1", result.ObservationsDeleted)
+	}
+	if result.PromptsDeleted != 1 {
+		t.Errorf("PromptsDeleted = %d, want 1", result.PromptsDeleted)
+	}
+
+	// Observation row must still exist but have deleted_at set.
+	var deletedAt *string
+	if err := s.db.QueryRow(`SELECT deleted_at FROM observations WHERE id = ?`, obsID).Scan(&deletedAt); err != nil {
+		t.Fatalf("scan deleted_at: %v", err)
+	}
+	if deletedAt == nil {
+		t.Errorf("expected deleted_at to be set after soft-delete, got nil")
+	}
+
+	// Prompts must be removed.
+	var promptCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_prompts WHERE project = ?`, "beta").Scan(&promptCount); err != nil {
+		t.Fatalf("count prompts: %v", err)
+	}
+	if promptCount != 0 {
+		t.Errorf("expected 0 prompts after soft DeleteProject, got %d", promptCount)
+	}
+
+	// Sessions must NOT be removed in soft-delete mode (FK constraint from soft-deleted obs).
+	var sessionCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE project = ?`, "beta").Scan(&sessionCount); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessionCount != 1 {
+		t.Errorf("expected sessions to remain intact after soft DeleteProject, got count %d", sessionCount)
+	}
+	// SessionsDeleted must be 0 in soft mode.
+	if result.SessionsDeleted != 0 {
+		t.Errorf("expected SessionsDeleted = 0 in soft mode, got %d", result.SessionsDeleted)
+	}
+}
+
+func TestDeleteProjectUnknownProjectReturnsError(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.DeleteProject("nonexistent-project-xyz", true)
+	if err == nil {
+		t.Fatal("expected error for unknown project, got nil")
+	}
+	if !errors.Is(err, ErrProjectNotFound) {
+		t.Errorf("expected ErrProjectNotFound, got %v", err)
+	}
+}
+
+func TestDeleteProjectEmptyNameReturnsError(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.DeleteProject("", true)
+	if err == nil {
+		t.Fatal("expected error for empty project name, got nil")
+	}
+}
+
+func TestDeleteProjectOrphansMemoryRelations(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s-del-proj-rel", "gamma", "/tmp/gamma"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-del-proj-rel",
+		Type:      "decision",
+		Title:     "rel-obs",
+		Content:   "content",
+		Project:   "gamma",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs: %v", err)
+	}
+
+	// Get sync_id of the observation for the relation.
+	var syncID string
+	if err := s.db.QueryRow(`SELECT sync_id FROM observations WHERE id = ?`, obsID).Scan(&syncID); err != nil {
+		t.Fatalf("get sync_id: %v", err)
+	}
+
+	// Insert a fake relation that references this observation.
+	relSyncID := "rel-" + syncID
+	if _, err := s.db.Exec(`
+		INSERT INTO memory_relations (sync_id, source_id, target_id, relation, judgment_status, created_at, updated_at)
+		VALUES (?, ?, 'other-obs', 'related', 'pending', datetime('now'), datetime('now'))
+	`, relSyncID, syncID); err != nil {
+		t.Fatalf("insert relation: %v", err)
+	}
+
+	if _, err := s.DeleteProject("gamma", true); err != nil {
+		t.Fatalf("DeleteProject: %v", err)
+	}
+
+	// The relation must be orphaned, not deleted.
+	var judgmentStatus string
+	if err := s.db.QueryRow(`SELECT judgment_status FROM memory_relations WHERE sync_id = ?`, relSyncID).Scan(&judgmentStatus); err != nil {
+		t.Fatalf("scan relation judgment_status: %v", err)
+	}
+	if judgmentStatus != "orphaned" {
+		t.Errorf("expected relation judgment_status = orphaned after hard delete, got %q", judgmentStatus)
+	}
+}
+
+func TestMostRecentActiveSessionReturnsUnEndedSession(t *testing.T) {
+	s := newTestStore(t)
+
+	// A hook-registered UUID session, never ended.
+	if err := s.CreateSession("uuid-active-1", "engram", "/work/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	id, ok, err := s.MostRecentActiveSession("engram")
+	if err != nil {
+		t.Fatalf("MostRecentActiveSession: %v", err)
+	}
+	if !ok || id != "uuid-active-1" {
+		t.Fatalf("expected active session uuid-active-1, got id=%q ok=%v", id, ok)
+	}
+}
+
+func TestMostRecentActiveSessionSkipsEndedSessions(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("uuid-ended-1", "engram", "/work/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := s.EndSession("uuid-ended-1", "done"); err != nil {
+		t.Fatalf("end session: %v", err)
+	}
+
+	_, ok, err := s.MostRecentActiveSession("engram")
+	if err != nil {
+		t.Fatalf("MostRecentActiveSession: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected no active session when the only session is ended, got ok=%v", ok)
+	}
+}
+
+func TestMostRecentActiveSessionNoSessionsReturnsFalse(t *testing.T) {
+	s := newTestStore(t)
+
+	_, ok, err := s.MostRecentActiveSession("engram")
+	if err != nil {
+		t.Fatalf("MostRecentActiveSession: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected ok=false for a project with no sessions, got ok=%v", ok)
+	}
+}
+
+func TestMostRecentActiveSessionPicksMostRecentWhenMultipleActive(t *testing.T) {
+	s := newTestStore(t)
+
+	// Two un-ended UUID sessions for the same project; the newer started_at wins.
+	if err := s.CreateSession("uuid-old", "engram", "/work/engram"); err != nil {
+		t.Fatalf("create old session: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, "2025-01-01 00:00:00", "uuid-old"); err != nil {
+		t.Fatalf("backdate old session: %v", err)
+	}
+	if err := s.CreateSession("uuid-new", "engram", "/work/engram"); err != nil {
+		t.Fatalf("create new session: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, "2025-06-01 00:00:00", "uuid-new"); err != nil {
+		t.Fatalf("set new session started_at: %v", err)
+	}
+
+	id, ok, err := s.MostRecentActiveSession("engram")
+	if err != nil {
+		t.Fatalf("MostRecentActiveSession: %v", err)
+	}
+	if !ok || id != "uuid-new" {
+		t.Fatalf("expected most recent active session uuid-new, got id=%q ok=%v", id, ok)
+	}
+}
+
+func TestMostRecentActiveSessionIgnoresManualSaveSessions(t *testing.T) {
+	s := newTestStore(t)
+
+	// The manual-save fallback session is also un-ended, but it must NOT be
+	// resolved as "the active session" — otherwise resolution becomes circular.
+	if err := s.CreateSession("manual-save-engram", "engram", "/work/engram"); err != nil {
+		t.Fatalf("create manual-save session: %v", err)
+	}
+
+	_, ok, err := s.MostRecentActiveSession("engram")
+	if err != nil {
+		t.Fatalf("MostRecentActiveSession: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected manual-save session to be ignored, got ok=%v", ok)
+	}
+}
+
+func TestMostRecentActiveSessionScopedByProject(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("uuid-other-proj", "other", "/work/other"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	_, ok, err := s.MostRecentActiveSession("engram")
+	if err != nil {
+		t.Fatalf("MostRecentActiveSession: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected no active session for engram when only 'other' has one, got ok=%v", ok)
 	}
 }
