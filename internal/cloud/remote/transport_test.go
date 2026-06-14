@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
 	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
@@ -46,6 +47,70 @@ func TestReadManifestReturnsHTTPStatusErrorForAuthAndPolicyFailures(t *testing.T
 			}
 			if statusErr.StatusCode != tc.statusCode {
 				t.Fatalf("expected status %d, got %d", tc.statusCode, statusErr.StatusCode)
+			}
+		})
+	}
+}
+
+func TestCloudHTTPClientTimeoutDefaultsAndOverrides(t *testing.T) {
+	t.Run("default timeout is 30 seconds for both transports", func(t *testing.T) {
+		t.Setenv(cloudHTTPTimeoutEnvVar, "")
+
+		rt, err := NewRemoteTransport("https://cloud.example.test", "token", "proj-a")
+		if err != nil {
+			t.Fatalf("NewRemoteTransport: %v", err)
+		}
+		if rt.httpClient.Timeout != defaultCloudHTTPTimeout {
+			t.Fatalf("expected remote transport timeout %s, got %s", defaultCloudHTTPTimeout, rt.httpClient.Timeout)
+		}
+
+		mt, err := NewMutationTransport("https://cloud.example.test", "token")
+		if err != nil {
+			t.Fatalf("NewMutationTransport: %v", err)
+		}
+		if mt.httpClient.Timeout != defaultCloudHTTPTimeout {
+			t.Fatalf("expected mutation transport timeout %s, got %s", defaultCloudHTTPTimeout, mt.httpClient.Timeout)
+		}
+	})
+
+	t.Run("env override applies to both transports", func(t *testing.T) {
+		t.Setenv(cloudHTTPTimeoutEnvVar, "75")
+
+		rt, err := NewRemoteTransport("https://cloud.example.test", "token", "proj-a")
+		if err != nil {
+			t.Fatalf("NewRemoteTransport: %v", err)
+		}
+		if rt.httpClient.Timeout != 75*time.Second {
+			t.Fatalf("expected remote transport timeout %s, got %s", 75*time.Second, rt.httpClient.Timeout)
+		}
+
+		mt, err := NewMutationTransport("https://cloud.example.test", "token")
+		if err != nil {
+			t.Fatalf("NewMutationTransport: %v", err)
+		}
+		if mt.httpClient.Timeout != 75*time.Second {
+			t.Fatalf("expected mutation transport timeout %s, got %s", 75*time.Second, mt.httpClient.Timeout)
+		}
+	})
+
+	for _, value := range []string{"0", "-5", "not-a-number", "9223372037"} {
+		t.Run("invalid value falls back to default "+value, func(t *testing.T) {
+			t.Setenv(cloudHTTPTimeoutEnvVar, value)
+
+			rt, err := NewRemoteTransport("https://cloud.example.test", "token", "proj-a")
+			if err != nil {
+				t.Fatalf("NewRemoteTransport: %v", err)
+			}
+			if rt.httpClient.Timeout != defaultCloudHTTPTimeout {
+				t.Fatalf("expected remote transport default timeout for %q, got %s", value, rt.httpClient.Timeout)
+			}
+
+			mt, err := NewMutationTransport("https://cloud.example.test", "token")
+			if err != nil {
+				t.Fatalf("NewMutationTransport: %v", err)
+			}
+			if mt.httpClient.Timeout != defaultCloudHTTPTimeout {
+				t.Fatalf("expected mutation transport default timeout for %q, got %s", value, mt.httpClient.Timeout)
 			}
 		})
 	}

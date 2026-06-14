@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,12 @@ type HTTPStatusError struct {
 	ErrorCode  string
 	Body       string
 }
+
+const (
+	defaultCloudHTTPTimeout = 30 * time.Second
+	cloudHTTPTimeoutEnvVar  = "ENGRAM_CLOUD_CLIENT_TIMEOUT_SECONDS"
+	maxCloudHTTPTimeoutSecs = int64(1<<63-1) / int64(time.Second)
+)
 
 func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("cloud: %s: status %d: %s", e.Operation, e.StatusCode, strings.TrimSpace(e.Body))
@@ -92,9 +100,21 @@ func NewRemoteTransport(baseURL, token, project string) (*RemoteTransport, error
 		token:   strings.TrimSpace(token),
 		project: project,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: cloudHTTPClientTimeout(),
 		},
 	}, nil
+}
+
+func cloudHTTPClientTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv(cloudHTTPTimeoutEnvVar))
+	if value == "" {
+		return defaultCloudHTTPTimeout
+	}
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || seconds <= 0 || seconds > maxCloudHTTPTimeoutSecs {
+		return defaultCloudHTTPTimeout
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func validateBaseURL(raw string) (string, error) {
@@ -311,7 +331,7 @@ func NewMutationTransport(baseURL, token string) (*MutationTransport, error) {
 		baseURL: normalized,
 		token:   strings.TrimSpace(token),
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: cloudHTTPClientTimeout(),
 		},
 	}, nil
 }
