@@ -48,6 +48,7 @@ const ENGRAM_TOOL_NAMES = new Set<string>(ENGRAM_TOOLS);
 const MEMORY_INSTRUCTIONS = `## Engram Persistent Memory — Protocol
 
 You have access to Engram, a persistent memory system that survives across sessions and compactions.
+These instructions are injected by gentle-engram, the Pi-native memory provider. Use the memory tools named in this section as the authoritative Pi memory contract. Do not infer alternative Engram tool names from other integrations unless the user explicitly asks you to use them.
 
 ### WHEN TO SAVE (mandatory — not optional)
 
@@ -149,23 +150,32 @@ interface ToolEndEvent {
 }
 
 class EngramHttpError extends Error {
-  constructor(message: string, readonly status: number, readonly data: unknown) {
+  readonly status: number;
+  readonly data: unknown;
+
+  constructor(message: string, status: number, data: unknown) {
     super(message);
     this.name = "EngramHttpError";
+    this.status = status;
+    this.data = data;
   }
 }
 
 async function engramFetch<TResponse = unknown>(path: string, opts: FetchOptions = {}): Promise<TResponse | null> {
-  let res: Response;
-  try {
-    res = await fetch(`${ENGRAM_URL}${redactUrlPath(path)}`, {
-      method: opts.method ?? "GET",
-      headers: opts.body ? { "Content-Type": "application/json" } : undefined,
-      body: opts.body ? JSON.stringify(redactValue(opts.body)) : undefined,
-    });
-  } catch {
-    return null;
+  let res: Response | undefined;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      res = await fetch(`${ENGRAM_URL}${redactUrlPath(path)}`, {
+        method: opts.method ?? "GET",
+        headers: opts.body ? { "Content-Type": "application/json" } : undefined,
+        body: opts.body ? JSON.stringify(redactValue(opts.body)) : undefined,
+      });
+      break;
+    } catch {
+      if (attempt < 2) await wait(150);
+    }
   }
+  if (!res) return null;
 
   let data: unknown = null;
   try {
@@ -415,6 +425,8 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
     project: optionalString("Filter by project name"),
     scope: optionalString("Filter by scope: project or personal"),
     limit: optionalNumber("Max results"),
+    all_projects: optionalBoolean("Search across every project; when true project is ignored"),
+    match_mode: optionalString("Match mode: all (default) or any for broader recall"),
   }),
   mem_save: Type.Object({
     title: Type.String({ description: "Short, searchable title" }),
@@ -551,7 +563,15 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
 
   switch (toolName) {
     case "mem_search":
-      return engramFetch(`/search${queryString({ q: params.query, type: params.type, project: params.project, scope: params.scope, limit: params.limit })}`);
+      return engramFetch(`/search${queryString({
+        q: params.query,
+        type: params.type,
+        project: params.all_projects ? undefined : params.project,
+        scope: params.scope,
+        limit: params.limit,
+        match_mode: params.match_mode,
+        all_projects: params.all_projects,
+      })}`);
     case "mem_context":
       if (!params.project) requireResolvedProject();
       return engramFetch(`/context${queryString({ project: params.project || project, scope: params.scope })}`);
@@ -698,7 +718,9 @@ async function executeMemoryTool(toolName: string, params: Record<string, unknow
 
   try {
     const data = await callMemoryTool(toolName, params, ctx);
-    if (data === null) throw new Error("Engram is unavailable");
+    if (data === null) {
+      throw new Error(`gentle-engram could not reach the Engram HTTP server at ${ENGRAM_URL}. The Pi-native mem_* tools are registered, but the native memory provider is not currently responding. Run mem_doctor or restart Engram.`);
+    }
     const result = { content: [{ type: "text" as const, text: textResult(data) }], details: { data } };
     if (toolName === "mem_doctor" && data && typeof data === "object" && "status" in data && data.status === "error") {
       const errorResult = { ...result, isError: true };
