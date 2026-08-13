@@ -179,7 +179,10 @@ func buildRuntimeAuthenticator(cfg cloud.Config, cs *cloudstore.CloudStore, allo
 
 func backfillAllowedProjectMutationChunks(ctx context.Context, cs *cloudstore.CloudStore, projects []string) error {
 	for _, project := range projects {
-		report, err := cs.BackfillMutationChunks(ctx, project, true)
+		// Incremental by design: this runs for every allowed project on every boot,
+		// before the HTTP listener opens, so an exhaustive per-project audit here
+		// costs startup latency and database egress on each cold start.
+		report, err := cs.MaterializeNewProjectMutations(ctx, project)
 		if err != nil {
 			return fmt.Errorf("cloud repair materialize-mutations for project %q: %w", project, err)
 		}

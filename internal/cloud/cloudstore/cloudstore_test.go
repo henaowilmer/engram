@@ -216,6 +216,86 @@ func TestMigrateRunsSessionBackfillOnceThenSkipsIt(t *testing.T) {
 	}
 }
 
+func TestMaterializeNewProjectMutationsAdvancesWatermarkAndStillCatchesNewWork(t *testing.T) {
+	dsn := os.Getenv("CLOUDSTORE_TEST_DSN")
+	if dsn == "" {
+		t.Skip("CLOUDSTORE_TEST_DSN not set — skipping integration test (requires Postgres)")
+	}
+	if !strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
+		t.Skip("test requires URL-style CLOUDSTORE_TEST_DSN so a per-test search_path can be attached")
+	}
+
+	schema := fmt.Sprintf("cloudstore_watermark_%d", time.Now().UnixNano())
+	adminDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open admin db: %v", err)
+	}
+	defer adminDB.Close()
+	if _, err := adminDB.ExecContext(context.Background(), `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() { _, _ = adminDB.ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`) })
+
+	testDSN := dsn + "?search_path=" + schema
+	if strings.Contains(dsn, "?") {
+		testDSN = dsn + "&search_path=" + schema
+	}
+
+	cs, err := New(cloud.Config{DSN: testDSN})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer cs.Close()
+
+	ctx := context.Background()
+	const project = "proj-watermark"
+
+	// Insert straight into the journal so nothing materializes these: this is the
+	// state the repair pass exists to reconcile.
+	recordMutation := func(sessionID string) {
+		t.Helper()
+		payload := fmt.Sprintf(`{"id":%q,"project":%q,"directory":"/work/p","started_at":"2026-05-04T01:45:00Z"}`, sessionID, project)
+		if _, err := cs.db.ExecContext(ctx,
+			`INSERT INTO cloud_mutations (project, entity, entity_key, op, payload) VALUES ($1, $2, $3, $4, $5)`,
+			project, store.SyncEntitySession, sessionID, store.SyncOpUpsert, payload,
+		); err != nil {
+			t.Fatalf("record mutation %s: %v", sessionID, err)
+		}
+	}
+
+	recordMutation("sess-1")
+	recordMutation("sess-2")
+
+	first, err := cs.MaterializeNewProjectMutations(ctx, project)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if first.CandidateMutations != 2 || first.ChunksInserted != 1 {
+		t.Fatalf("first run must materialize both outstanding mutations: %+v", first)
+	}
+
+	// The settled span must not be read again. The exhaustive sweep this replaced
+	// would report both mutations as AlreadyMaterialized here, which is exactly the
+	// per-boot re-read that cost startup latency and database egress.
+	second, err := cs.MaterializeNewProjectMutations(ctx, project)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if second.CandidateMutations != 0 || second.AlreadyMaterialized != 0 || second.ChunksPlanned != 0 {
+		t.Fatalf("second run must not re-examine the settled span: %+v", second)
+	}
+
+	// A watermark is not a "run once" flag: work arriving after it must still land.
+	recordMutation("sess-3")
+	third, err := cs.MaterializeNewProjectMutations(ctx, project)
+	if err != nil {
+		t.Fatalf("third run: %v", err)
+	}
+	if third.CandidateMutations != 1 || third.ChunksInserted != 1 {
+		t.Fatalf("third run must materialize the mutation recorded after the watermark: %+v", third)
+	}
+}
+
 func TestMaterializedMutationBatchChunkIncludesObservationAlongsidePromptAndSession(t *testing.T) {
 	obsPayload := json.RawMessage(`{
 		"sync_id":"obs-04081be99000bdf5",

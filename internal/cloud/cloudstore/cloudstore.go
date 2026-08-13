@@ -760,6 +760,16 @@ func (cs *CloudStore) migrate(ctx context.Context) error {
 		END $$`,
 		`CREATE INDEX IF NOT EXISTS idx_cloud_mutations_project ON cloud_mutations(project)`,
 		`CREATE INDEX IF NOT EXISTS idx_cloud_mutations_seq ON cloud_mutations(seq)`,
+		// Serves the "anything new for this project?" probe in
+		// MaterializeNewProjectMutations, which runs once per allowed project on
+		// every boot. Neither single-column index above can answer it without
+		// scanning every mutation the project has ever recorded.
+		`CREATE INDEX IF NOT EXISTS idx_cloud_mutations_project_seq ON cloud_mutations(project, seq)`,
+		`CREATE TABLE IF NOT EXISTS cloud_mutation_backfill_watermarks (
+			project    TEXT PRIMARY KEY,
+			last_seq   BIGINT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
 		// cloud_sync_audit_log: persistent audit trail for push-rejection events (REQ-400).
 		`CREATE TABLE IF NOT EXISTS cloud_sync_audit_log (
 			id           SERIAL PRIMARY KEY,
@@ -857,6 +867,11 @@ type MutationChunkBackfillReport struct {
 	InvalidMutations    int    `json:"invalid_mutations"`
 	ChunksPlanned       int    `json:"chunks_planned"`
 	ChunksInserted      int    `json:"chunks_inserted"`
+
+	// maxSeqScanned carries the highest cloud_mutations.seq this run examined, so
+	// MaterializeNewProjectMutations can advance its watermark. Unexported on
+	// purpose: it is internal bookkeeping, not part of the reported result.
+	maxSeqScanned int64
 }
 
 // InsertMutationBatch inserts a batch of mutations into the cloud_mutations journal.
@@ -934,7 +949,28 @@ func (cs *CloudStore) InsertMutationBatch(ctx context.Context, batch []MutationE
 
 const mutationBackfillChunkSize = 100
 
+// BackfillMutationChunks audits every mutation the project has ever recorded and
+// materializes the ones no chunk covers yet. Callers that run on every boot should
+// prefer MaterializeNewProjectMutations, which reaches the same end state
+// incrementally; this exhaustive sweep is for explicit, operator-driven repair.
 func (cs *CloudStore) BackfillMutationChunks(ctx context.Context, project string, apply bool) (MutationChunkBackfillReport, error) {
+	return cs.backfillMutationChunks(ctx, project, apply, 0)
+}
+
+// MaterializeNewProjectMutations materializes only the mutations recorded since
+// this project's last successful run.
+//
+// The exhaustive sweep it replaces on the startup path streamed every row of
+// cloud_mutations and every chunk payload to the client just to conclude that
+// everything was already materialized — on a cross-region database that is well
+// over a hundred megabytes of transfer per boot, paid before the HTTP listener
+// opens and therefore against the container startup probe's budget. Steady state
+// here is one indexed existence probe that transfers nothing.
+//
+// The watermark advances only over mutations this run actually committed as
+// materialized (or deliberately skipped), so a failure part-way leaves the next
+// boot to retry the same span rather than stepping over it.
+func (cs *CloudStore) MaterializeNewProjectMutations(ctx context.Context, project string) (MutationChunkBackfillReport, error) {
 	if cs == nil || cs.db == nil {
 		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: not initialized")
 	}
@@ -943,17 +979,82 @@ func (cs *CloudStore) BackfillMutationChunks(ctx context.Context, project string
 		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: project is required")
 	}
 
-	report := MutationChunkBackfillReport{Project: project, Applied: apply}
+	watermark, err := cs.mutationBackfillWatermark(ctx, project)
+	if err != nil {
+		return MutationChunkBackfillReport{}, err
+	}
+
+	var hasNew bool
+	if err := cs.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM cloud_mutations WHERE project = $1 AND seq > $2)`,
+		project, watermark,
+	).Scan(&hasNew); err != nil {
+		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: probe new mutations for %q: %w", project, err)
+	}
+	if !hasNew {
+		return MutationChunkBackfillReport{Project: project, Applied: true, maxSeqScanned: watermark}, nil
+	}
+
+	report, err := cs.backfillMutationChunks(ctx, project, true, watermark)
+	if err != nil {
+		return MutationChunkBackfillReport{}, err
+	}
+	if report.maxSeqScanned > watermark {
+		if err := cs.setMutationBackfillWatermark(ctx, project, report.maxSeqScanned); err != nil {
+			return MutationChunkBackfillReport{}, err
+		}
+	}
+	return report, nil
+}
+
+func (cs *CloudStore) mutationBackfillWatermark(ctx context.Context, project string) (int64, error) {
+	var lastSeq int64
+	err := cs.db.QueryRowContext(ctx,
+		`SELECT last_seq FROM cloud_mutation_backfill_watermarks WHERE project = $1`, project).Scan(&lastSeq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("cloudstore: read mutation backfill watermark for %q: %w", project, err)
+	}
+	return lastSeq, nil
+}
+
+func (cs *CloudStore) setMutationBackfillWatermark(ctx context.Context, project string, lastSeq int64) error {
+	// The guard keeps a slower concurrent run from dragging the watermark
+	// backwards over mutations a later run already materialized.
+	if _, err := cs.db.ExecContext(ctx, `
+		INSERT INTO cloud_mutation_backfill_watermarks (project, last_seq, updated_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (project) DO UPDATE SET last_seq = EXCLUDED.last_seq, updated_at = NOW()
+		WHERE cloud_mutation_backfill_watermarks.last_seq < EXCLUDED.last_seq`,
+		project, lastSeq,
+	); err != nil {
+		return fmt.Errorf("cloudstore: record mutation backfill watermark for %q: %w", project, err)
+	}
+	return nil
+}
+
+func (cs *CloudStore) backfillMutationChunks(ctx context.Context, project string, apply bool, sinceSeq int64) (MutationChunkBackfillReport, error) {
+	if cs == nil || cs.db == nil {
+		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: not initialized")
+	}
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: project is required")
+	}
+
+	report := MutationChunkBackfillReport{Project: project, Applied: apply, maxSeqScanned: sinceSeq}
 	materialized, err := cs.existingChunkMutationSignatures(ctx, project)
 	if err != nil {
 		return MutationChunkBackfillReport{}, err
 	}
 
 	rows, err := cs.db.QueryContext(ctx, `
-		SELECT project, entity, entity_key, op, payload::text
+		SELECT seq, project, entity, entity_key, op, payload::text
 		FROM cloud_mutations
-		WHERE project = $1
-		ORDER BY seq ASC`, project)
+		WHERE project = $1 AND seq > $2
+		ORDER BY seq ASC`, project, sinceSeq)
 	if err != nil {
 		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: query mutation chunk backfill candidates: %w", err)
 	}
@@ -963,8 +1064,15 @@ func (cs *CloudStore) BackfillMutationChunks(ctx context.Context, project string
 	for rows.Next() {
 		var entry MutationEntry
 		var payload string
-		if err := rows.Scan(&entry.Project, &entry.Entity, &entry.EntityKey, &entry.Op, &payload); err != nil {
+		var seq int64
+		if err := rows.Scan(&seq, &entry.Project, &entry.Entity, &entry.EntityKey, &entry.Op, &payload); err != nil {
 			return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: scan mutation chunk backfill candidate: %w", err)
+		}
+		// Rows skipped below still advance the watermark: an entity that cannot be
+		// materialized, or a payload that cannot be parsed, fails identically on
+		// every later pass, so replaying it on each boot buys nothing.
+		if seq > report.maxSeqScanned {
+			report.maxSeqScanned = seq
 		}
 		if !isChunkMaterializableMutationEntity(entry.Entity) {
 			continue
