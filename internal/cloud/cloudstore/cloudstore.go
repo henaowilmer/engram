@@ -32,6 +32,12 @@ type CloudStore struct {
 var ErrChunkNotFound = errors.New("cloudstore: chunk not found")
 var ErrChunkConflict = errors.New("cloudstore: chunk id conflict")
 
+// migrateTimeout bounds schema migration so a blocked statement surfaces as a
+// startup error instead of hanging the process forever behind an unbounded
+// context.Background(). It is deliberately generous: a first-ever migration on
+// an already-populated database still has to finish its one-time backfill.
+const migrateTimeout = 10 * time.Minute
+
 func New(cfg cloud.Config) (*CloudStore, error) {
 	dsn := strings.TrimSpace(cfg.DSN)
 	if dsn == "" {
@@ -41,6 +47,14 @@ func New(cfg cloud.Config) (*CloudStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cloudstore: open postgres: %w", err)
 	}
+	// cloud.Config.MaxPool was parsed but never applied, leaving database/sql at
+	// its unlimited-connections default. Serverless Postgres endpoints cap
+	// connections per compute, so an unbounded pool degrades into connection
+	// exhaustion once more than a few instances are live.
+	if cfg.MaxPool > 0 {
+		db.SetMaxOpenConns(cfg.MaxPool)
+		db.SetMaxIdleConns(cfg.MaxPool)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
@@ -48,7 +62,9 @@ func New(cfg cloud.Config) (*CloudStore, error) {
 		return nil, fmt.Errorf("cloudstore: ping postgres: %w", err)
 	}
 	store := &CloudStore{db: db}
-	if err := store.migrate(context.Background()); err != nil {
+	migrateCtx, cancelMigrate := context.WithTimeout(context.Background(), migrateTimeout)
+	defer cancelMigrate()
+	if err := store.migrate(migrateCtx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -554,6 +570,10 @@ func (cs *CloudStore) ReadChunk(ctx context.Context, project, chunkID string) ([
 
 func (cs *CloudStore) migrate(ctx context.Context) error {
 	queries := []string{
+		`CREATE TABLE IF NOT EXISTS cloud_schema_migrations (
+			name TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
 		`CREATE TABLE IF NOT EXISTS cloud_users (
 			id BIGSERIAL PRIMARY KEY,
 			username TEXT UNIQUE NOT NULL,
@@ -761,8 +781,48 @@ func (cs *CloudStore) migrate(ctx context.Context) error {
 			return fmt.Errorf("cloudstore: migrate: %w", err)
 		}
 	}
-	if err := cs.backfillProjectSessionsFromChunks(ctx); err != nil {
+	applied, err := cs.schemaMigrationApplied(ctx, schemaMigrationBackfillSessions)
+	if err != nil {
 		return err
+	}
+	if !applied {
+		if err := cs.backfillProjectSessionsFromChunks(ctx); err != nil {
+			return err
+		}
+		if err := cs.markSchemaMigrationApplied(ctx, schemaMigrationBackfillSessions); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// schemaMigrationBackfillSessions marks the one-time retroactive indexing of
+// cloud_project_sessions from pre-existing cloud_chunks payloads.
+//
+// Chunks written after that index landed are indexed inside writeChunk's own
+// transaction, so this backfill only ever repairs history — it can never have
+// new work to do on a database that has already run it once. Re-running it on
+// every boot is not merely wasteful: backfillProjectSessionsFromChunks streams
+// the payload column of every row in cloud_chunks to the client before the HTTP
+// listener opens, which on a cross-region serverless Postgres is enough to
+// exhaust a container platform's startup probe budget and fail the deploy.
+const schemaMigrationBackfillSessions = "backfill_project_sessions_from_chunks"
+
+func (cs *CloudStore) schemaMigrationApplied(ctx context.Context, name string) (bool, error) {
+	var applied bool
+	if err := cs.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM cloud_schema_migrations WHERE name = $1)`, name,
+	).Scan(&applied); err != nil {
+		return false, fmt.Errorf("cloudstore: read schema migration %q: %w", name, err)
+	}
+	return applied, nil
+}
+
+func (cs *CloudStore) markSchemaMigrationApplied(ctx context.Context, name string) error {
+	if _, err := cs.db.ExecContext(ctx,
+		`INSERT INTO cloud_schema_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, name,
+	); err != nil {
+		return fmt.Errorf("cloudstore: record schema migration %q: %w", name, err)
 	}
 	return nil
 }

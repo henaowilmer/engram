@@ -96,6 +96,126 @@ func TestMigrateAcceptsModernCloudChunksWithoutLegacyColumns(t *testing.T) {
 	cs.Close()
 }
 
+func TestMigrateRunsSessionBackfillOnceThenSkipsIt(t *testing.T) {
+	dsn := os.Getenv("CLOUDSTORE_TEST_DSN")
+	if dsn == "" {
+		t.Skip("CLOUDSTORE_TEST_DSN not set — skipping integration test (requires Postgres)")
+	}
+	if !strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
+		t.Skip("test requires URL-style CLOUDSTORE_TEST_DSN so a per-test search_path can be attached")
+	}
+
+	schema := fmt.Sprintf("cloudstore_backfill_once_%d", time.Now().UnixNano())
+	adminDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open admin db: %v", err)
+	}
+	defer adminDB.Close()
+	if _, err := adminDB.ExecContext(context.Background(), `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() { _, _ = adminDB.ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`) })
+
+	testDSN := dsn + "?search_path=" + schema
+	if strings.Contains(dsn, "?") {
+		testDSN = dsn + "&search_path=" + schema
+	}
+
+	// Seed a chunk the way history left them: inserted directly rather than through
+	// WriteChunk, so nothing indexed its sessions at write time and the first
+	// migrate has genuine backfill work to do.
+	seed, err := sql.Open("pgx", testDSN)
+	if err != nil {
+		t.Fatalf("open schema db: %v", err)
+	}
+	if _, err := seed.ExecContext(context.Background(), `CREATE TABLE cloud_chunks (
+		project_name TEXT NOT NULL DEFAULT 'default',
+		chunk_id TEXT NOT NULL,
+		created_by TEXT NOT NULL,
+		client_created_at TIMESTAMPTZ,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		payload JSONB NOT NULL,
+		sessions_count INTEGER NOT NULL DEFAULT 0,
+		observations_count INTEGER NOT NULL DEFAULT 0,
+		prompts_count INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		seed.Close()
+		t.Fatalf("create legacy cloud_chunks: %v", err)
+	}
+	// migrate() indexes sessions by two different routes: a server-side
+	// INSERT...SELECT that only reads payload->'sessions', and the client-side Go
+	// backfill, which additionally decodes session mutations. Only the Go backfill
+	// is guarded, so a session that exists ONLY in the mutation journal is the
+	// observable signal of whether that expensive pass ran.
+	if _, err := seed.ExecContext(context.Background(),
+		`INSERT INTO cloud_chunks (project_name, chunk_id, created_by, payload) VALUES ($1, $2, $3, $4)`,
+		"proj-a", "chunk-1", "tester",
+		`{"sessions":[{"id":"sql-indexed-session"}],"observations":[],"prompts":[],`+
+			`"mutations":[{"seq":1,"entity":"session","entity_key":"mutation-only-session","op":"upsert",`+
+			`"payload":"{\"id\":\"mutation-only-session\"}"}]}`,
+	); err != nil {
+		seed.Close()
+		t.Fatalf("seed legacy chunk: %v", err)
+	}
+	seed.Close()
+
+	indexedSessions := func() []string {
+		t.Helper()
+		probe, err := sql.Open("pgx", testDSN)
+		if err != nil {
+			t.Fatalf("open probe db: %v", err)
+		}
+		defer probe.Close()
+		rows, err := probe.QueryContext(context.Background(), `SELECT session_id FROM cloud_project_sessions ORDER BY session_id`)
+		if err != nil {
+			t.Fatalf("read indexed sessions: %v", err)
+		}
+		defer rows.Close()
+		ids := []string{}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				t.Fatalf("scan indexed session: %v", err)
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("iterate indexed sessions: %v", err)
+		}
+		return ids
+	}
+
+	first, err := New(cloud.Config{DSN: testDSN})
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	first.Close()
+	if got, want := indexedSessions(), []string{"mutation-only-session", "sql-indexed-session"}; !slices.Equal(got, want) {
+		t.Fatalf("first migrate must run the backfill and index both routes: got %v, want %v", got, want)
+	}
+
+	// Clearing the index is what makes the second boot observable: the chunk is
+	// still there, so whichever indexing route runs again will repopulate its rows.
+	wipe, err := sql.Open("pgx", testDSN)
+	if err != nil {
+		t.Fatalf("open wipe db: %v", err)
+	}
+	if _, err := wipe.ExecContext(context.Background(), `DELETE FROM cloud_project_sessions`); err != nil {
+		wipe.Close()
+		t.Fatalf("clear session index: %v", err)
+	}
+	wipe.Close()
+
+	second, err := New(cloud.Config{DSN: testDSN})
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+	second.Close()
+	if got, want := indexedSessions(), []string{"sql-indexed-session"}; !slices.Equal(got, want) {
+		t.Fatalf("second migrate must skip the recorded Go backfill and leave only the cheap server-side route: got %v, want %v", got, want)
+	}
+}
+
 func TestMaterializedMutationBatchChunkIncludesObservationAlongsidePromptAndSession(t *testing.T) {
 	obsPayload := json.RawMessage(`{
 		"sync_id":"obs-04081be99000bdf5",
